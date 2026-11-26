@@ -211,6 +211,7 @@ func (p *Persister) DeleteRelationTuples(ctx context.Context, rs ...*relationtup
 	defer otelx.End(span, &err)
 
 	return p.Transaction(ctx, func(ctx context.Context) error {
+		changed := false
 		for chunk := range slices.Chunk(rs, chunkSizeDeleteTuple) {
 			q, args, err := buildDelete(p.NetworkID(ctx), chunk)
 			if err != nil {
@@ -219,9 +220,16 @@ func (p *Persister) DeleteRelationTuples(ctx context.Context, rs ...*relationtup
 			if q == "" {
 				continue
 			}
-			if err := p.Connection(ctx).RawQuery(q, args...).Exec(); err != nil {
+			affected, err := p.Connection(ctx).RawQuery(q, args...).ExecWithCount()
+			if err != nil {
 				return sqlcon.HandleError(err)
 			}
+			if affected > 0 {
+				changed = true
+			}
+		}
+		if changed {
+			return p.advanceAuthorizationRevision(ctx)
 		}
 		return nil
 	})
@@ -239,7 +247,10 @@ func (p *Persister) DeleteAllRelationTuples(ctx context.Context, query *relation
 		}
 
 		var res relationTuples
-		return sqlQuery.Delete(&res)
+		if err := sqlQuery.Delete(&res); err != nil {
+			return err
+		}
+		return p.advanceAuthorizationRevision(ctx)
 	})
 }
 
@@ -347,7 +358,7 @@ func (p *Persister) WriteRelationTuples(ctx context.Context, rs ...*relationtupl
 				return sqlcon.HandleError(err)
 			}
 		}
-		return nil
+		return p.advanceAuthorizationRevision(ctx)
 	})
 }
 
@@ -360,9 +371,15 @@ func (p *Persister) TransactRelationTuples(ctx context.Context, ins []*relationt
 	}
 
 	return p.Transaction(ctx, func(ctx context.Context) error {
-		if err := p.WriteRelationTuples(ctx, ins...); err != nil {
+		// This transact call owns the revision bump so an insert and delete in
+		// one atomic transaction publish one new authorization generation.
+		scopedCtx := withDeferredAuthorizationRevision(ctx)
+		if err := p.WriteRelationTuples(scopedCtx, ins...); err != nil {
 			return err
 		}
-		return p.DeleteRelationTuples(ctx, del...)
+		if err := p.DeleteRelationTuples(scopedCtx, del...); err != nil {
+			return err
+		}
+		return p.forceAdvanceAuthorizationRevision(scopedCtx)
 	})
 }

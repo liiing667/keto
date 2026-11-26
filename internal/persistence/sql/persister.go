@@ -125,7 +125,11 @@ func (p *Persister) WithLatestSnapshot(ctx context.Context, f func(ctx context.C
 
 	// Reuse an existing transaction rather than nesting.
 	if popx.GetConnection(ctx, conn).TX != nil {
-		return f(ctx)
+		snapshotCtx, err := p.withAuthorizationBasis(ctx)
+		if err != nil {
+			return err
+		}
+		return f(snapshotCtx)
 	}
 
 	// REPEATABLE READ pins a consistent snapshot so all queries in the check see
@@ -136,7 +140,11 @@ func (p *Persister) WithLatestSnapshot(ctx context.Context, f func(ctx context.C
 		Isolation: sql.LevelRepeatableRead,
 		ReadOnly:  true,
 	}, func(ctx context.Context, _ *pop.Connection) error {
-		return f(ctx)
+		snapshotCtx, err := p.withAuthorizationBasis(ctx)
+		if err != nil {
+			return err
+		}
+		return f(snapshotCtx)
 	})
 }
 

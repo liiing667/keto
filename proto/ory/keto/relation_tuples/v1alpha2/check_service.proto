@@ -84,7 +84,15 @@ message CheckResponse {
   //
   // It is false by default if no ACL matches.
   bool allowed = 1;
-  // This field is not implemented yet and has no effect.
+  // Opaque identifier of the authorization revision used for this decision.
+  //
+  // Equal tokens identify the same persistent tuple generation and policy
+  // fingerprint. Different tokens identify a newer authorization state. The
+  // token is an audit and cache-invalidation marker; request-supplied tokens
+  // are not yet used to time-travel to the historical snapshot.
+  //
+  // Historical note: the full snapshot-token protocol described below is not
+  // implemented yet.
   // <!--
   // The last known snapshot token ONLY specified if
   // the request had not specified a snaptoken,
@@ -112,7 +120,11 @@ message CheckResponseWithError {
   //
   // If the check was performed successfully, this will be empty.
   string error = 2;
-  // This field is not implemented yet and has no effect.
+  // Opaque identifier of the authorization revision used for this item.
+  // Results in one BatchCheck response share the same token.
+  //
+  // Historical note: the full snapshot-token protocol described below is not
+  // implemented yet.
   // <!--
   // The last known snapshot token ONLY specified if
   // the request had not specified a snaptoken,

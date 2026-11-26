@@ -16,6 +16,13 @@ type (
 		Membership Membership
 		Err        error
 		Limitation LimitationKind
+
+		// SnapshotToken identifies the authorization basis that produced this
+		// result. It is empty for lightweight managers that do not expose a
+		// persistent revision.
+		SnapshotToken string
+		// AuthorizationBasis is the structured form of SnapshotToken.
+		AuthorizationBasis relationtuple.AuthorizationBasis
 	}
 
 	Membership int

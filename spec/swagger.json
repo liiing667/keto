@@ -868,6 +868,10 @@
         "allowed": {
           "description": "whether the relation tuple is allowed",
           "type": "boolean"
+        },
+        "snaptoken": {
+          "description": "Opaque identifier of the authorization revision used for this decision. Equal tokens denote the same stable authorization state; different tokens denote a policy or relationship change.",
+          "type": "string"
         }
       }
     },
@@ -882,6 +886,10 @@
         },
         "error": {
           "description": "any error generated while checking the relation tuple",
+          "type": "string"
+        },
+        "snaptoken": {
+          "description": "Opaque identifier of the authorization revision used for this item. Results in one batch share the same token.",
           "type": "string"
         }
       }

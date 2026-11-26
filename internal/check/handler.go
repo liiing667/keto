@@ -100,6 +100,9 @@ type CheckPermissionResult struct {
 	//
 	// required: true
 	Allowed bool `json:"allowed"`
+
+	// Opaque identifier of the authorization revision used for this decision.
+	Snaptoken string `json:"snaptoken,omitempty"`
 }
 
 // Check Permission Result With Error
@@ -114,6 +117,9 @@ type CheckPermissionResultWithError struct {
 	//
 	// required: false
 	Error string `json:"error,omitempty"`
+
+	// Opaque identifier of the authorization revision used for this decision.
+	Snaptoken string `json:"snaptoken,omitempty"`
 }
 
 // Check Permission Request Parameters
@@ -146,12 +152,12 @@ type checkPermission struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: keto-public-high
 func (h *Handler) getCheckNoStatus(w http.ResponseWriter, r *http.Request) {
-	allowed, err := h.getCheck(r.Context(), r.URL.Query())
+	result, err := h.getCheck(r.Context(), r.URL.Query())
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
 		return
 	}
-	h.d.Writer().Write(w, r, &CheckPermissionResult{Allowed: allowed})
+	h.d.Writer().Write(w, r, &result)
 }
 
 // Check Permission Or Error Request Parameters
@@ -187,40 +193,44 @@ type checkPermissionOrError struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: keto-public-high
 func (h *Handler) getCheckMirrorStatus(w http.ResponseWriter, r *http.Request) {
-	allowed, err := h.getCheck(r.Context(), r.URL.Query())
+	result, err := h.getCheck(r.Context(), r.URL.Query())
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
 		return
 	}
 
-	if allowed {
-		h.d.Writer().Write(w, r, &CheckPermissionResult{Allowed: allowed})
+	if result.Allowed {
+		h.d.Writer().Write(w, r, &result)
 		return
 	}
 
-	h.d.Writer().WriteCode(w, r, http.StatusForbidden, &CheckPermissionResult{Allowed: allowed})
+	h.d.Writer().WriteCode(w, r, http.StatusForbidden, &result)
 }
 
-func (h *Handler) getCheck(ctx context.Context, q url.Values) (bool, error) {
+func (h *Handler) getCheck(ctx context.Context, q url.Values) (CheckPermissionResult, error) {
 	maxDepth, err := x.GetMaxDepthFromQuery(q)
 	if err != nil {
-		return false, err
+		return CheckPermissionResult{}, err
 	}
 
 	tuple, err := (&ketoapi.RelationTuple{}).FromURLQuery(q)
 	if err != nil {
-		return false, err
+		return CheckPermissionResult{}, err
 	}
 
 	it, err := h.d.ReadOnlyMapper().FromTuple(ctx, tuple)
 	// herodot.ErrNotFound occurs when the namespace is unknown
 	if errors.Is(err, herodot.ErrNotFound()) {
-		return false, nil
+		return CheckPermissionResult{Allowed: false}, nil
 	} else if err != nil {
-		return false, err
+		return CheckPermissionResult{}, err
 	}
 
-	return h.d.PermissionEngine().CheckIsMember(ctx, it[0], maxDepth)
+	allowed, result, err := h.d.PermissionEngine().CheckIsMemberWithSnapshot(ctx, it[0], maxDepth)
+	if err != nil {
+		return CheckPermissionResult{}, err
+	}
+	return CheckPermissionResult{Allowed: allowed, Snaptoken: result.SnapshotToken}, nil
 }
 
 // Check Permission using Post Request Parameters
@@ -267,12 +277,12 @@ type postCheckPermissionBody struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: keto-public-high
 func (h *Handler) postCheckNoStatus(w http.ResponseWriter, r *http.Request) {
-	allowed, err := h.postCheck(r.Context(), r.Body, r.URL.Query())
+	result, err := h.postCheck(r.Context(), r.Body, r.URL.Query())
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
 		return
 	}
-	h.d.Writer().Write(w, r, &CheckPermissionResult{Allowed: allowed})
+	h.d.Writer().Write(w, r, &result)
 }
 
 // Post Check Permission Or Error Request Parameters
@@ -320,39 +330,43 @@ type postCheckPermissionOrErrorBody struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: keto-public-high
 func (h *Handler) postCheckMirrorStatus(w http.ResponseWriter, r *http.Request) {
-	allowed, err := h.postCheck(r.Context(), r.Body, r.URL.Query())
+	result, err := h.postCheck(r.Context(), r.Body, r.URL.Query())
 	if err != nil {
 		h.d.Writer().WriteError(w, r, err)
 		return
 	}
 
-	if allowed {
-		h.d.Writer().Write(w, r, &CheckPermissionResult{Allowed: allowed})
+	if result.Allowed {
+		h.d.Writer().Write(w, r, &result)
 		return
 	}
 
-	h.d.Writer().WriteCode(w, r, http.StatusForbidden, &CheckPermissionResult{Allowed: allowed})
+	h.d.Writer().WriteCode(w, r, http.StatusForbidden, &result)
 }
 
-func (h *Handler) postCheck(ctx context.Context, body io.Reader, query url.Values) (bool, error) {
+func (h *Handler) postCheck(ctx context.Context, body io.Reader, query url.Values) (CheckPermissionResult, error) {
 	maxDepth, err := x.GetMaxDepthFromQuery(query)
 	if err != nil {
-		return false, err
+		return CheckPermissionResult{}, err
 	}
 
 	var tuple ketoapi.RelationTuple
 	if err := json.NewDecoder(body).Decode(&tuple); err != nil {
-		return false, errors.WithStack(herodot.ErrBadRequest().WithErrorf("could not unmarshal json: %s", err.Error()))
+		return CheckPermissionResult{}, errors.WithStack(herodot.ErrBadRequest().WithErrorf("could not unmarshal json: %s", err.Error()))
 	}
 	t, err := h.d.ReadOnlyMapper().FromTuple(ctx, &tuple)
 	// herodot.ErrNotFound occurs when the namespace is unknown
 	if errors.Is(err, herodot.ErrNotFound()) {
-		return false, nil
+		return CheckPermissionResult{Allowed: false}, nil
 	} else if err != nil {
-		return false, err
+		return CheckPermissionResult{}, err
 	}
 
-	return h.d.PermissionEngine().CheckIsMember(ctx, t[0], maxDepth)
+	allowed, result, err := h.d.PermissionEngine().CheckIsMemberWithSnapshot(ctx, t[0], maxDepth)
+	if err != nil {
+		return CheckPermissionResult{}, err
+	}
+	return CheckPermissionResult{Allowed: allowed, Snaptoken: result.SnapshotToken}, nil
 }
 
 func (h *Handler) Check(ctx context.Context, req *connect.Request[rts.CheckRequest]) (*connect.Response[rts.CheckResponse], error) {
@@ -372,7 +386,7 @@ func (h *Handler) Check(ctx context.Context, req *connect.Request[rts.CheckReque
 	if err != nil {
 		return nil, err
 	}
-	allowed, err := h.d.PermissionEngine().CheckIsMember(ctx, internalTuple[0], int(req.Msg.MaxDepth))
+	allowed, result, err := h.d.PermissionEngine().CheckIsMemberWithSnapshot(ctx, internalTuple[0], int(req.Msg.MaxDepth))
 	// TODO add content change handling
 	if err != nil {
 		return nil, err
@@ -380,8 +394,17 @@ func (h *Handler) Check(ctx context.Context, req *connect.Request[rts.CheckReque
 
 	return connect.NewResponse(&rts.CheckResponse{ //nolint:gosec // Snaptoken is not a credential, just a placeholder value.
 		Allowed:   allowed,
-		Snaptoken: "not yet implemented",
+		Snaptoken: snapshotTokenOrPlaceholder(result.SnapshotToken),
 	}), nil
+}
+
+func snapshotTokenOrPlaceholder(token string) string {
+	if token != "" {
+		return token
+	}
+	// Keep the historical API value for managers that do not expose a
+	// persistent authorization revision.
+	return "not yet implemented"
 }
 
 // Batch Check Permission Request Parameters
@@ -472,8 +495,9 @@ func (h *Handler) doBatchCheck(ctx context.Context, body io.Reader, query url.Va
 	responses := make([]*CheckPermissionResultWithError, len(request.Tuples))
 	for i, result := range results {
 		responses[i] = &CheckPermissionResultWithError{
-			Allowed: result.Membership == IsMember,
-			Error:   batchResultErrMsg(result, strict),
+			Allowed:   result.Membership == IsMember,
+			Error:     batchResultErrMsg(result, strict),
+			Snaptoken: result.SnapshotToken,
 		}
 	}
 
@@ -503,7 +527,7 @@ func (h *Handler) BatchCheck(ctx context.Context, req *connect.Request[rts.Batch
 		responses[i] = &rts.CheckResponseWithError{ //nolint:gosec // Snaptoken is not a credential, just a placeholder value.
 			Allowed:   result.Membership == IsMember,
 			Error:     batchResultErrMsg(result, strict),
-			Snaptoken: "not yet implemented",
+			Snaptoken: snapshotTokenOrPlaceholder(result.SnapshotToken),
 		}
 	}
 

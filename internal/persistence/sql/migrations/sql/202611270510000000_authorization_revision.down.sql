@@ -1,0 +1,1 @@
+DROP TABLE keto_authorization_revisions;
