@@ -16,6 +16,9 @@ type (
 		Membership Membership
 		Err        error
 		Limitation LimitationKind
+		// SnapshotToken identifies the read snapshot that produced this result.
+		// It is empty when the configured manager does not expose a marker.
+		SnapshotToken string
 	}
 
 	Membership int

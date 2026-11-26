@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"time"
 
 	"github.com/gofrs/uuid"
 	"github.com/ory/pop/v6"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/ory/keto/internal/driver/config"
 	"github.com/ory/keto/internal/persistence"
+	"github.com/ory/keto/internal/relationtuple"
 )
 
 type (
@@ -135,8 +137,11 @@ func (p *Persister) WithLatestSnapshot(ctx context.Context, f func(ctx context.C
 	return popx.TransactionWithOptions(ctx, conn, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,
 		ReadOnly:  true,
-	}, func(ctx context.Context, _ *pop.Connection) error {
-		return f(ctx)
+	}, func(txCtx context.Context, _ *pop.Connection) error {
+		// Generate the marker inside the transaction so it is as close as
+		// possible to the database snapshot established by the first query.
+		txCtx = relationtuple.WithSnapshotToken(txCtx, relationtuple.NewSnapshotToken(time.Now()))
+		return f(txCtx)
 	})
 }
 

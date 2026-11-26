@@ -372,7 +372,7 @@ func (h *Handler) Check(ctx context.Context, req *connect.Request[rts.CheckReque
 	if err != nil {
 		return nil, err
 	}
-	allowed, err := h.d.PermissionEngine().CheckIsMember(ctx, internalTuple[0], int(req.Msg.MaxDepth))
+	allowed, result, err := h.d.PermissionEngine().CheckIsMemberWithSnapshot(ctx, internalTuple[0], int(req.Msg.MaxDepth))
 	// TODO add content change handling
 	if err != nil {
 		return nil, err
@@ -380,8 +380,17 @@ func (h *Handler) Check(ctx context.Context, req *connect.Request[rts.CheckReque
 
 	return connect.NewResponse(&rts.CheckResponse{ //nolint:gosec // Snaptoken is not a credential, just a placeholder value.
 		Allowed:   allowed,
-		Snaptoken: "not yet implemented",
+		Snaptoken: snapshotTokenOrPlaceholder(result.SnapshotToken),
 	}), nil
+}
+
+func snapshotTokenOrPlaceholder(token string) string {
+	if token != "" {
+		return token
+	}
+	// Keep the historical value for managers that do not provide a snapshot
+	// marker (including lightweight test doubles).
+	return "not yet implemented"
 }
 
 // Batch Check Permission Request Parameters
@@ -503,7 +512,7 @@ func (h *Handler) BatchCheck(ctx context.Context, req *connect.Request[rts.Batch
 		responses[i] = &rts.CheckResponseWithError{ //nolint:gosec // Snaptoken is not a credential, just a placeholder value.
 			Allowed:   result.Membership == IsMember,
 			Error:     batchResultErrMsg(result, strict),
-			Snaptoken: "not yet implemented",
+			Snaptoken: snapshotTokenOrPlaceholder(result.SnapshotToken),
 		}
 	}
 

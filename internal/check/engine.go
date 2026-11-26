@@ -5,11 +5,13 @@ package check
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/ory/herodot"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 
@@ -60,25 +62,29 @@ func NewEngine(d EngineDependencies) *Engine {
 // object in the namespace either directly or indirectly and returns a boolean
 // result.
 func (e *Engine) CheckIsMember(ctx context.Context, r *relationTuple, restDepth int) (bool, error) {
+	allowed, _, err := e.CheckIsMemberWithSnapshot(ctx, r, restDepth)
+	return allowed, err
+}
+
+// CheckIsMemberWithSnapshot is [Engine.CheckIsMember] but also returns the
+// underlying result, including its snapshot identifier.
+func (e *Engine) CheckIsMemberWithSnapshot(ctx context.Context, r *relationTuple, restDepth int) (bool, Result, error) {
 	result := e.CheckRelationTuple(ctx, r, restDepth)
 	if result.Err != nil {
-		return false, result.Err
+		return false, result, result.Err
 	}
 	if result.Membership == MembershipUnknown && result.Limitation != "" && e.dep.Config(ctx).StrictMode() {
-		return false, errLimitationExceeded().WithReason(string(result.Limitation))
+		return false, result, errLimitationExceeded().WithReason(string(result.Limitation))
 	}
-	return result.Membership == IsMember, nil
+	return result.Membership == IsMember, result, nil
 }
 
 // CheckRelationTuple checks if the relation tuple's subject has the relation on
 // the object in the namespace either directly or indirectly and returns a check
 // result.
 func (e *Engine) CheckRelationTuple(ctx context.Context, r *relationTuple, restDepth int) (res Result) {
-	ctx, span := e.dep.Tracer(ctx).Tracer().Start(ctx, "Engine.CheckRelationTuple")
-	defer otelx.End(span, &res.Err)
-
 	txErr := e.dep.RelationTupleManager().WithLatestSnapshot(ctx, func(ctx context.Context) error {
-		res = e.dep.Checker().CheckRelationTuple(ctx, r, restDepth)
+		res = e.checkRelationTuple(ctx, r, restDepth)
 		return res.Err
 	})
 	if txErr != nil && res.Err == nil {
@@ -86,6 +92,19 @@ func (e *Engine) CheckRelationTuple(ctx context.Context, r *relationTuple, restD
 		res.Err = herodot.ErrInternalServerError().WithWrap(txErr)
 
 		e.dep.Logger().WithError(txErr).WithField("tuple", r.String()).Error("could not open a consistent read snapshot for the check")
+	}
+	return res
+}
+
+// checkRelationTuple evaluates one tuple inside the caller's snapshot scope.
+func (e *Engine) checkRelationTuple(ctx context.Context, r *relationTuple, restDepth int) (res Result) {
+	ctx, span := e.dep.Tracer(ctx).Tracer().Start(ctx, "Engine.CheckRelationTuple")
+	defer otelx.End(span, &res.Err)
+
+	res = e.dep.Checker().CheckRelationTuple(ctx, r, restDepth)
+	res.SnapshotToken = relationtuple.SnapshotTokenFromContext(ctx)
+	if res.SnapshotToken != "" {
+		span.SetAttributes(attribute.String("keto.snapshot_token", res.SnapshotToken))
 	}
 	if res.Err == nil {
 		span.AddEvent(events.NewPermissionsChecked(ctx))
@@ -95,33 +114,57 @@ func (e *Engine) CheckRelationTuple(ctx context.Context, r *relationTuple, restD
 
 // BatchCheck makes parallelized check requests for tuples. The check results
 // are returned as a slice where the result index matches the input tuple index.
+//
+// All tuples are evaluated in one latest-snapshot scope so a revocation or
+// policy reload during the batch cannot make different workers observe
+// different authorization revisions.
 func (e *Engine) BatchCheck(
 	ctx context.Context,
 	tuples []*ketoapi.RelationTuple,
 	maxDepth int,
 ) ([]Result, error) {
-	eg := &errgroup.Group{}
-	eg.SetLimit(e.dep.Config(ctx).BatchCheckParallelizationLimit())
-
-	mapper := e.dep.ReadOnlyMapper()
 	results := make([]Result, len(tuples))
-	for i, tuple := range tuples {
-		eg.Go(func() error {
-			internalTuple, err := mapper.FromTuple(ctx, tuple)
-			if err != nil {
-				results[i] = Result{
-					Membership: MembershipUnknown,
-					Err:        err,
-				}
-			} else {
-				results[i] = e.CheckRelationTuple(ctx, internalTuple[0], maxDepth)
-			}
-			return nil
-		})
-	}
 
-	if err := eg.Wait(); err != nil {
-		return nil, err
+	txErr := e.dep.RelationTupleManager().WithLatestSnapshot(ctx, func(ctx context.Context) error {
+		eg, egCtx := errgroup.WithContext(ctx)
+		eg.SetLimit(e.dep.Config(ctx).BatchCheckParallelizationLimit())
+
+		mapper := e.dep.ReadOnlyMapper()
+		for i, tuple := range tuples {
+			i, tuple := i, tuple
+			if egCtx.Err() != nil {
+				break
+			}
+			eg.Go(func() error {
+				if err := egCtx.Err(); err != nil {
+					return err
+				}
+
+				internalTuple, err := mapper.FromTuple(egCtx, tuple)
+				if err != nil {
+					results[i] = Result{
+						Membership: MembershipUnknown,
+						Err:        err,
+					}
+					return egCtx.Err()
+				}
+
+				results[i] = e.checkRelationTuple(egCtx, internalTuple[0], maxDepth)
+				return egCtx.Err()
+			})
+		}
+
+		if err := eg.Wait(); err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
+	if txErr != nil {
+		if errors.Is(txErr, context.Canceled) || errors.Is(txErr, context.DeadlineExceeded) {
+			return nil, txErr
+		}
+		e.dep.Logger().WithError(txErr).Error("could not open a consistent read snapshot for the batch check")
+		return nil, herodot.ErrInternalServerError().WithWrap(txErr)
 	}
 	return results, nil
 }
