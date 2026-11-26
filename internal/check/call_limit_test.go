@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ory/keto/internal/check"
+	"github.com/ory/keto/internal/check/step"
 	"github.com/ory/keto/internal/check/trace"
 	"github.com/ory/keto/internal/driver"
 	"github.com/ory/keto/internal/namespace"
@@ -41,7 +42,7 @@ func TestCallLimit(t *testing.T) {
 
 	type outcome int
 	const (
-		cyclicError outcome = iota
+		cyclicDenial outcome = iota
 		member
 		depthLimited
 	)
@@ -68,7 +69,7 @@ func TestCallLimit(t *testing.T) {
 			opts:      []driver.TestRegistryOption{driver.WithConfig("limit.max_read_depth", 65535)},
 			check:     "Resource:doc#edit@User:alice",
 			restDepth: 65535,
-			want:      cyclicError,
+			want:      cyclicDenial,
 		},
 		{
 			name: "branching cycle aborts decisively",
@@ -83,10 +84,10 @@ func TestCallLimit(t *testing.T) {
 				}`,
 			check:     "R:x#a@User:u",
 			restDepth: 5,
-			want:      cyclicError,
+			want:      cyclicDenial,
 		},
 		{
-			name: "self-loop is bounded by RestDepth",
+			name: "self-loop is denied as a cycle",
 			opl: `
 				class User implements Namespace {}
 				class Resource implements Namespace {
@@ -96,7 +97,7 @@ func TestCallLimit(t *testing.T) {
 				}`,
 			check:     "Resource:doc#edit@User:alice",
 			restDepth: 5,
-			want:      depthLimited,
+			want:      cyclicDenial,
 		},
 		{
 			name: "legit role chain resolves",
@@ -130,9 +131,10 @@ func TestCallLimit(t *testing.T) {
 
 			assertResult := func(t *testing.T, res check.Result) {
 				switch tc.want {
-				case cyclicError:
-					requireCyclicError(t, res.Err)
-					require.Equal(t, check.MembershipUnknown, res.Membership)
+				case cyclicDenial:
+					require.NoError(t, res.Err)
+					require.Equal(t, check.NotMember, res.Membership)
+					require.Empty(t, res.Limitation)
 				case member:
 					require.NoError(t, res.Err)
 					require.Equal(t, check.IsMember, res.Membership)
@@ -154,4 +156,118 @@ func TestCallLimit(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestCycleDetection verifies that cyclic permit references are resolved as a
+// controlled denial (NotMember, no error) instead of exhausting the recursion
+// budget, and that the answer is stable across repeated evaluations.
+func TestCycleDetection(t *testing.T) {
+	t.Parallel()
+
+	opl := `
+		class User implements Namespace {}
+		class Resource implements Namespace {
+			related: {
+				owners: User[]
+			}
+			permits = {
+				edit: (ctx: Context): boolean => this.related.owners.includes(ctx.subject) || this.permits.review(ctx),
+				review: (ctx: Context): boolean => this.permits.edit(ctx),
+			}
+		}`
+	reg := newRegistryForOPL(t, opl,
+		driver.WithConfig("limit.max_read_depth", 65535),
+	)
+	testhelpers.MapAndInsertTuplesFromString(t, reg, []string{
+		"Resource:doc#owners@User:alice",
+	})
+
+	// A subject whose only path loops must be denied, deterministically and
+	// without surfacing an error, on every evaluation.
+	denied := testhelpers.TupleFromString(t, "Resource:doc#edit@User:bob")
+	for i := 0; i < 5; i++ {
+		res := check.NewEngine(reg).CheckRelationTuple(t.Context(), denied, 65535)
+		require.NoError(t, res.Err, "iteration %d", i)
+		require.Equal(t, check.NotMember, res.Membership, "iteration %d", i)
+		require.Empty(t, res.Limitation, "iteration %d", i)
+	}
+
+	// The direct-membership branch still wins for a legitimate owner even
+	// though an alternative branch of the same permit is cyclic.
+	owner := testhelpers.TupleFromString(t, "Resource:doc#edit@User:alice")
+	ownerRes := check.NewEngine(reg).CheckRelationTuple(t.Context(), owner, 65535)
+	require.NoError(t, ownerRes.Err)
+	require.Equal(t, check.IsMember, ownerRes.Membership)
+
+	// The trace engine must apply the same semantics.
+	traceRes, tree := trace.NewEngine(reg).CheckRelationTupleWithTrace(t.Context(), denied, 65535)
+	require.NotNil(t, tree)
+	require.NoError(t, traceRes.Err)
+	require.Equal(t, check.NotMember, traceRes.Membership)
+}
+
+// TestCycleDetectionDiamondShape makes sure that two sibling branches
+// converging on the same intermediate relation (a diamond) are not mistaken
+// for a cycle: the shared sub-check is visited on independent DFS paths, not
+// twice on the same path.
+func TestCycleDetectionDiamondShape(t *testing.T) {
+	t.Parallel()
+
+	opl := `
+		class User implements Namespace {}
+		class Doc implements Namespace {
+			related: {
+				viewers: User[]
+			}
+			permits = {
+				view: (ctx: Context): boolean => this.permits.a(ctx) || this.permits.b(ctx),
+				a: (ctx: Context): boolean => this.permits.shared(ctx),
+				b: (ctx: Context): boolean => this.permits.shared(ctx),
+				shared: (ctx: Context): boolean => this.related.viewers.includes(ctx.subject),
+			}
+		}`
+	reg := newRegistryForOPL(t, opl, driver.WithConfig("limit.max_read_depth", 65535))
+	testhelpers.MapAndInsertTuplesFromString(t, reg, []string{"Doc:d#viewers@User:u"})
+
+	member := check.NewEngine(reg).CheckRelationTuple(t.Context(),
+		testhelpers.TupleFromString(t, "Doc:d#view@User:u"), 65535)
+	require.NoError(t, member.Err)
+	require.Equal(t, check.IsMember, member.Membership)
+
+	denied := check.NewEngine(reg).CheckRelationTuple(t.Context(),
+		testhelpers.TupleFromString(t, "Doc:d#view@User:other"), 65535)
+	require.NoError(t, denied.Err)
+	require.Equal(t, check.NotMember, denied.Membership)
+}
+
+// backstopRegistry wires an executor with only the call-budget middleware,
+// simulating a configuration where cycle detection is not active.
+type backstopRegistry struct {
+	driver.Registry
+}
+
+func (r *backstopRegistry) Checker() check.Checker {
+	return step.NewExecutor(r.Registry, step.CallLimitMiddleware())
+}
+
+// TestCallBudgetBackstop verifies that the call-budget middleware still
+// aborts a runaway evaluation as a decisive error when it is wired without
+// cycle detection. It is the last line of defense against stack exhaustion.
+func TestCallBudgetBackstop(t *testing.T) {
+	t.Parallel()
+
+	opl := `
+		class User implements Namespace {}
+		class R2 implements Namespace {
+			permits = {
+				a: (ctx: Context): boolean => !this.permits.b(ctx),
+				b: (ctx: Context): boolean => !this.permits.a(ctx),
+			}
+		}`
+	reg := newRegistryForOPL(t, opl, driver.WithConfig("limit.max_read_depth", 65535))
+	rt := testhelpers.TupleFromString(t, "R2:x#a@User:u")
+
+	res := check.NewEngine(&backstopRegistry{Registry: reg}).CheckRelationTuple(t.Context(), rt, 65535)
+	requireCyclicError(t, res.Err)
+	require.Equal(t, check.MembershipUnknown, res.Membership)
 }

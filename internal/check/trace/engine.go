@@ -39,7 +39,7 @@ func (e *Engine) CheckRelationTupleWithTrace(ctx context.Context, tuple *relatio
 	defer otelx.End(span, &res.Err)
 
 	session := NewSession()
-	executor := step.NewExecutor(e.deps, session.Middleware(), step.CallLimitMiddleware())
+	executor := step.NewExecutor(e.deps, session.Middleware(), step.CycleDetectionMiddleware(), step.CallLimitMiddleware())
 
 	res = executor.CheckRelationTuple(ctx, tuple, restDepth)
 	session.Wait()

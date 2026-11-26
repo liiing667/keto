@@ -24,6 +24,11 @@ var callBudgetKey callBudgetKeyType
 // (e.g. two permits that reference each other) would otherwise recurse until
 // the stack overflows and crashes the process. This is a blanket per-path
 // ceiling, well above any real config and well below a stack overflow.
+//
+// Cyclic permit references are normally intercepted earlier, and turned into a
+// controlled denial, by CycleDetectionMiddleware. This budget remains the
+// defense-in-depth backstop for any runaway evaluation that reaches an
+// executor without cycle detection enabled.
 const maxCallSteps = 1000
 
 func errCallBudgetExceeded() error {
