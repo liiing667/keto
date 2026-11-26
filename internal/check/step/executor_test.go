@@ -61,8 +61,9 @@ func TestBaseExecutorRunSequential(t *testing.T) {
 				{
 					name:    "runs all steps when none is member",
 					results: []check.Result{check.ResultUnknown, check.ResultNotMember, check.ResultUnknown, check.ResultNotMember, check.ResultNotMember},
-					// todo: ideally, this should be Unknown
-					expectedResult: check.ResultNotMember,
+					// An indeterminate branch means the union cannot be
+					// reported as a definite NotMember.
+					expectedResult: check.ResultUnknown,
 					expectedCalls:  []int{0, 1, 2, 3, 4},
 				},
 				{
@@ -227,6 +228,24 @@ func TestBaseExecutorRunSequential(t *testing.T) {
 				{
 					name:           "Limit + NotMember = NotMember",
 					results:        []check.Result{unknownLimit, check.ResultNotMember},
+					expectedResult: check.ResultNotMember,
+					expectedCalls:  []int{0, 1},
+				},
+				{
+					name:           "Member + Unknown = Unknown",
+					results:        []check.Result{check.ResultIsMember, check.ResultUnknown},
+					expectedResult: check.ResultUnknown,
+					expectedCalls:  []int{0, 1},
+				},
+				{
+					name:           "Unknown + Member = Unknown",
+					results:        []check.Result{check.ResultUnknown, check.ResultIsMember},
+					expectedResult: check.ResultUnknown,
+					expectedCalls:  []int{0, 1},
+				},
+				{
+					name:           "Unknown + NotMember = NotMember",
+					results:        []check.Result{check.ResultUnknown, check.ResultNotMember},
 					expectedResult: check.ResultNotMember,
 					expectedCalls:  []int{0, 1},
 				},

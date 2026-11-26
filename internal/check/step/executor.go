@@ -147,6 +147,11 @@ type stepGroup struct {
 	result     check.Result
 	set        bool
 	limitation check.LimitationKind
+	// unknown records that at least one step returned an indeterminate result.
+	// Such a result must never be collapsed into the mode's default, because
+	// for intersections the default is "IsMember" and would turn a truncated
+	// (inconclusive) check into a definite allow.
+	unknown bool
 
 	mode runMode
 }
@@ -219,9 +224,21 @@ func (g *stepGroup) handle(r check.Result) {
 		g.cancel()
 		return
 	}
-	if r.Membership == check.MembershipUnknown && r.Limitation != "" {
-		g.AddLimitation(r.Limitation)
+	if r.Membership == check.MembershipUnknown {
+		g.recordUnknown(r.Limitation)
 	}
+}
+
+// recordUnknown remembers that a branch could not be resolved. When a
+// limitation is known, it is kept so callers can distinguish depth/width
+// truncation from other indeterminate results.
+func (g *stepGroup) recordUnknown(l check.LimitationKind) {
+	g.mu.Lock()
+	g.unknown = true
+	if g.limitation == "" && l != "" {
+		g.limitation = l
+	}
+	g.mu.Unlock()
 }
 
 // Done reports whether a decisive result has been reached.
@@ -250,12 +267,15 @@ func (g *stepGroup) Result() check.Result {
 
 	// No decisive result was set. Return in priority order:
 	// 1. Context cancelled by parent or sibling — propagate the error.
-	// 2. A limitation was recorded — result is indeterminate.
+	// 2. An indeterminate branch was seen — result is indeterminate. This
+	//    takes precedence over the mode default; in particular, an
+	//    intersection must not report IsMember just because every branch that
+	//    did run returned IsMember.
 	// 3. Neither — no step was decisive, so fall back to the mode default.
 	if !g.set {
 		if ctxErr != nil {
 			g.result = check.Result{Membership: check.MembershipUnknown, Err: ctxErr}
-		} else if g.limitation != "" {
+		} else if g.unknown || g.limitation != "" {
 			g.result = check.Result{Membership: check.MembershipUnknown, Limitation: g.limitation}
 		} else {
 			g.result = g.mode.NoDecisionResult()
